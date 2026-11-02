@@ -1,0 +1,958 @@
+---
+title: "Data Preparation & Scoring"
+author: "XXXX"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+This file prepares the analytic dataset. It cleans the raw survey data from all five waves, describes the sample, scores each measure and applies timing-based censoring. The raw survey files contain identifying information (for example, email addresses), so they are not shared. The output of this file, `GZMCore.csv`, is the analytic dataset used in all later scripts.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Packages
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(readr)
+library(readxl)
+library(lubridate)
+library(psych)
+library(lme4)
+library(lavaan)
+
+# Set WD
+set.seed(123)
+setwd("C:XXXX")
+
+# Raw Qualtrics exports (not shared)
+W0 <- read.csv("Baseline.csv")
+W1 <- read.csv("FollowUp1.csv")
+W2 <- read.csv("FollowUp2.csv")
+W3 <- read.csv("FollowUp3.csv")
+W4 <- read.csv("FollowUp4.csv")
+```
+
+# Part 1: Data Cleaning
+
+## Combine Waves
+
+Each wave is labelled and stacked into one dataset so the same cleaning steps can be applied to every wave.
+
+```{r combine waves}
+# Follow-up surveys stored the email address in Q5
+W1 <- rename(W1, Email = Q5)
+W2 <- rename(W2, Email = Q5)
+W3 <- rename(W3, Email = Q5)
+W4 <- rename(W4, Email = Q5)
+
+dat <- bind_rows(
+  mutate(W0, Wave = "W0"),
+  mutate(W1, Wave = "W1"),
+  mutate(W2, Wave = "W2"),
+  mutate(W3, Wave = "W3"),
+  mutate(W4, Wave = "W4")
+)
+
+# Standardise emails (lower case, no extra spaces) so they match across waves
+dat <- dat %>%
+  mutate(
+    Email    = str_squish(str_to_lower(as.character(Email))),
+    Progress = as.numeric(Progress)
+  )
+
+# Remove the extra header rows in Qualtrics exports (these have no Progress value)
+dat <- filter(dat, !is.na(Progress))
+
+count(dat, Wave)
+```
+
+## Response-Level Exclusions
+
+Each response is checked within its own wave. Steps are applied in order: attention checks, survey progress, completion speed, then duplicate responses.
+
+```{r attention checks}
+# Both attention checks must be answered correctly (ACQ1 = 5 and ACQ2 = 4)
+dat <- mutate(dat, fail_attention = !(ACQ1 == 5 & ACQ2 == 4))
+
+count(dat, Wave, fail_attention)
+cat("Participants failing an attention check:",
+    n_distinct(dat$Email[which(dat$fail_attention)]), "\n")
+
+dat <- filter(dat, !fail_attention)
+```
+
+```{r survey progress}
+# At least 98% of the survey must be completed
+dat <- mutate(dat, fail_progress = Progress < 98)
+
+count(dat, Wave, fail_progress)
+cat("Participants with incomplete surveys:",
+    n_distinct(dat$Email[which(dat$fail_progress)]), "\n")
+
+dat <- filter(dat, !fail_progress)
+```
+
+```{r completion speed}
+# The fastest 1% of responses in each wave are treated as implausibly quick
+dat <- dat %>%
+  mutate(duration_secs = as.numeric(Duration..in.seconds.)) %>%
+  group_by(Wave) %>%
+  mutate(fast_cutoff = quantile(duration_secs[duration_secs > 0], 0.01, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(fail_speed = !is.na(duration_secs) & duration_secs < fast_cutoff)
+
+count(dat, Wave, fail_speed)
+cat("Participants with implausibly fast responses:",
+    n_distinct(dat$Email[which(dat$fail_speed)]), "\n")
+
+dat <- filter(dat, !fail_speed)
+```
+
+```{r duplicate responses}
+# Where an email appears more than once in a wave, keep the earliest response
+# Responses without an email are kept at this step
+dat <- dat %>%
+  mutate(end_time = dmy_hm(EndDate)) %>%
+  arrange(Wave, Email, end_time) %>%
+  mutate(duplicate = !is.na(Email) & Email != "" & duplicated(paste(Wave, Email)))
+
+count(dat, Wave, duplicate)
+
+dat <- filter(dat, !duplicate)
+```
+
+## Participant-Level Exclusions
+
+These participants are removed from every wave.
+
+```{r sex assigned at birth check}
+# Participants who reported being assigned male at birth (SAB = 1) at baseline,
+# but later reported an age of first menstruation, gave inconsistent responses
+amab_baseline <- dat %>%
+  filter(Wave == "W0", SAB == 1) %>%
+  pull(Email)
+
+reported_period <- dat %>%
+  mutate(period_age = as.numeric(str_extract(as.character(PERIODAGE), "\\d+\\.?\\d*"))) %>%
+  filter(!is.na(period_age), period_age > 0) %>%
+  pull(Email)
+
+remove_inconsistent <- unique(intersect(amab_baseline, reported_period))
+cat("Participants removed for inconsistent responses:", length(remove_inconsistent), "\n")
+
+dat <- filter(dat, !Email %in% remove_inconsistent)
+```
+
+```{r setup-paths, include=FALSE}
+blocked_email_path <- "C:XXXX"
+```
+
+```{r flagged participants}
+# Participants flagged during the study after manual review of response
+# patterns, IP addresses, email communication and response timing
+# The list of flagged emails is not shared
+blocked <- read_excel(blocked_email_path) %>%
+  mutate(Email = str_squish(str_to_lower(as.character(emails)))) %>%
+  filter(!is.na(Email), Email != "") %>%
+  distinct(Email)
+
+dat <- mutate(dat, flagged = Email %in% blocked$Email)
+
+count(dat, Wave, flagged)
+
+cat("Flagged participants:", n_distinct(dat$Email[dat$flagged]), "\n")
+
+dat <- filter(dat, !flagged)
+```
+
+```{r baseline cohort}
+# Follow-up responses are kept only if the participant passed all baseline checks
+baseline_emails <- dat %>%
+  filter(Wave == "W0", !is.na(Email), Email != "") %>%
+  distinct(Email) %>%
+  pull(Email)
+
+dat <- mutate(dat, not_in_baseline = Wave != "W0" & !Email %in% baseline_emails)
+
+count(dat, Wave, not_in_baseline)
+
+dat <- filter(dat, !not_in_baseline)
+```
+
+## Survey Timing
+
+The models assume surveys were roughly equally spaced. Each follow-up is checked against the previous wave, and is "on schedule" if completed within ±25% of the intended 30 days (22.5 to 37.5 days). Off-schedule follow-ups are set to missing later (see Part 4).
+
+```{r survey timing}
+# Completion date of each survey, one column per wave
+dates <- dat %>%
+  filter(Email %in% baseline_emails) %>%
+  mutate(date = as.Date(dmy_hm(EndDate))) %>%
+  select(Email, Wave, date) %>%
+  pivot_wider(names_from = Wave, values_from = date)
+
+# Days since the previous wave
+timing <- dates %>%
+  mutate(
+    lag_W1 = as.numeric(W1 - W0),
+    lag_W2 = as.numeric(W2 - W1),
+    lag_W3 = as.numeric(W3 - W2),
+    lag_W4 = as.numeric(W4 - W3)
+  ) %>%
+  select(Email, lag_W1, lag_W2, lag_W3, lag_W4) %>%
+  pivot_longer(-Email, names_to = "Wave", names_prefix = "lag_", values_to = "lag_days") %>%
+  mutate(Tolerance = lag_days >= 22.5 & lag_days <= 37.5)
+
+# Add the timing flag to the data (baseline has no previous wave, so it stays missing)
+dat <- left_join(dat, select(timing, Email, Wave, Tolerance), by = c("Email", "Wave"))
+```
+
+## Participant IDs
+
+Each participant receives an ID and email addresses are removed.
+
+```{r participant ids}
+id_key <- dat %>%
+  filter(Wave == "W0") %>%
+  distinct(Email) %>%
+  arrange(Email) %>%
+  mutate(ID = sprintf("%03d", row_number()))
+
+long <- dat %>%
+  left_join(id_key, by = "Email") %>%
+  filter(!is.na(ID)) %>%
+  select(-Email) %>%
+  arrange(ID, Wave)
+```
+
+```{r identity experience data}
+# Participants are removed if they have no sexual identity development
+# experience data at baseline, or none across all waves
+sid_check <- long %>%
+  mutate(has_sid = !is.na(SID) & str_squish(as.character(SID)) != "") %>%
+  group_by(ID) %>%
+  summarise(
+    any_sid      = any(has_sid),
+    baseline_sid = any(has_sid[Wave == "W0"])
+  )
+
+no_sid <- sid_check %>%
+  filter(!any_sid | !baseline_sid) %>%
+  pull(ID)
+
+cat("Participants removed for no identity experience data:", length(no_sid), "\n")
+
+long <- filter(long, !ID %in% no_sid)
+cat("Final sample:", n_distinct(long$ID), "\n")
+```
+
+## Retention and Response Patterns
+
+These summaries describe the final sample and do not change the data.
+
+```{r retention}
+baseline_n <- n_distinct(long$ID)
+
+long %>%
+  group_by(Wave) %>%
+  summarise(Respondents = n_distinct(ID)) %>%
+  mutate(
+    Retention_pct     = round(Respondents / baseline_n * 100, 1),
+    From_Previous_pct = round(Respondents / lag(Respondents) * 100, 1)
+  )
+```
+
+```{r timing summary}
+# Days between surveys for the final sample
+final_emails <- id_key %>%
+  filter(ID %in% long$ID) %>%
+  pull(Email)
+
+timing %>%
+  filter(Email %in% final_emails, !is.na(lag_days)) %>%
+  group_by(Wave) %>%
+  summarise(
+    Mean_Days   = round(mean(lag_days), 1),
+    SD_Days     = round(sd(lag_days), 1),
+    Min_Days    = min(lag_days),
+    Max_Days    = max(lag_days),
+    N           = n(),
+    N_Outside   = sum(!Tolerance),
+    Pct_Outside = round(100 * N_Outside / N, 1)
+  )
+```
+
+```{r surveys completed}
+# Surveys completed per participant, before timing-based censoring
+surveys <- long %>%
+  group_by(ID) %>%
+  summarise(n_surveys = n_distinct(Wave))
+
+table(surveys$n_surveys)
+round(100 * prop.table(table(surveys$n_surveys)), 1)
+round(c(M = mean(surveys$n_surveys), SD = sd(surveys$n_surveys), Mdn = median(surveys$n_surveys)), 2)
+```
+
+```{r no experiences selected}
+# Follow-up surveys where no identity development experiences were selected
+long %>%
+  filter(Wave != "W0") %>%
+  mutate(none_selected = is.na(SID) | trimws(SID) == "") %>%
+  count(Wave, none_selected) %>%
+  group_by(Wave) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+
+# Part 2: Demographics
+
+Demographics were collected at baseline.
+
+```{r age}
+# Age was recorded as response codes; codes 8 to 22 correspond to ages 13 to 27
+long <- long %>%
+  mutate(
+    Age = as.numeric(Age),
+    Age = ifelse(Age >= 8 & Age <= 22, Age + 5, Age)
+  )
+
+# One row per participant at baseline
+demo <- long %>%
+  filter(Wave == "W0") %>%
+  distinct(ID, .keep_all = TRUE)
+
+round(c(M = mean(demo$Age, na.rm = TRUE), SD = sd(demo$Age, na.rm = TRUE)), 2)
+```
+
+```{r sex assigned at birth}
+# 1 = assigned male, 2 = assigned female, 3 = intersex, 4 = prefer not to say
+table(demo$SAB, useNA = "ifany")
+round(100 * table(demo$SAB, useNA = "ifany") / nrow(demo), 2)
+```
+
+## Gender Identity
+
+Gender identity (multi-select) is grouped using the response codes, sex assigned at birth and any self-described text. Rules are applied in order, and the first rule that applies sets the group.
+
+Gender codes: 1 = woman, 2 = man, 3 = non-binary, 4 = trans/gender diverse, 5 = questioning, 6 = self-describe, 7 = prefer not to say.
+
+```{r gender identity}
+# Text patterns for self-described gender
+expansive_text <- "\\b(genderfluid|gender\\s*fluid|gender[-\\s]?fluid|queer|genderqueer|question|confused|unsure|demi[-\\s]?girl|demi[-\\s]?boy|demigender|work|agender|detached|hard|exist)\\b"
+feminine_text  <- "\\b(girl|fem|transfeminine)\\b"
+masculine_text <- "\\b(boy|masc|transmasculine)\\b"
+
+demo <- demo %>%
+  mutate(
+    gender      = coalesce(as.character(IdentityGender), ""),
+    gender_text = coalesce(as.character(IdentityGender_6_TEXT), ""),
+    sab         = as.numeric(SAB),
+    n_selected  = str_count(gender, "[0-9]+"),
+    woman       = grepl("\\b1\\b", gender),
+    man         = grepl("\\b2\\b", gender),
+    nonbinary   = grepl("\\b3\\b", gender),
+    trans       = grepl("\\b4\\b", gender),
+    questioning = grepl("\\b5\\b", gender),
+    gender_described = grepl("\\b6\\b", gender),
+    GenderLabel = case_when(
+      gender_described & grepl(expansive_text, gender_text, ignore.case = TRUE)             ~ "Gender-Expansive Individuals",
+      gender_described & sab == 1 & grepl(feminine_text, gender_text, ignore.case = TRUE)   ~ "Transfeminine Individuals",
+      gender_described & sab == 2 & grepl(masculine_text, gender_text, ignore.case = TRUE)  ~ "Transmasculine Individuals",
+      gender_described                                                                      ~ "Unclassified",
+      woman & man                                                                    ~ "Gender-Expansive Individuals",
+      sab %in% c(3, 4) & (nonbinary | trans)                                         ~ "Gender-Expansive Individuals",
+      n_selected == 1 & man & sab %in% c(1, 3)                                       ~ "Cisgender Sexual Diverse Men",
+      n_selected == 1 & woman & sab %in% c(2, 3)                                     ~ "Cisgender Sexual Diverse Women",
+      n_selected == 1 & trans & sab == 1                                             ~ "Transfeminine Individuals",
+      n_selected == 1 & trans & sab == 2                                             ~ "Transmasculine Individuals",
+      woman & sab == 1                                                               ~ "Transfeminine Individuals",
+      man & sab == 2                                                                 ~ "Transmasculine Individuals",
+      (nonbinary | trans | questioning) & sab %in% c(1, 2, 3)                        ~ "Gender-Expansive Individuals",
+      TRUE                                                                           ~ "Unclassified"
+    )
+  )
+
+# Numeric codes used in the analyses
+gender_levels <- c("Cisgender Sexual Diverse Men",
+                   "Cisgender Sexual Diverse Women",
+                   "Gender-Expansive Individuals",
+                   "Transfeminine Individuals",
+                   "Transmasculine Individuals",
+                   "Unclassified")
+
+demo <- mutate(demo, GenderGroup = as.integer(factor(GenderLabel, levels = gender_levels)))
+
+count(demo, GenderGroup, GenderLabel) %>%
+  mutate(pct = round(100 * n / nrow(demo), 2))
+```
+
+## Sexual Identity
+
+Sexual identity (multi-select) is grouped into four categories. As with gender, rules are applied in order.
+
+Sexuality codes: 1 = lesbian, 2 = mostly attracted to girls, 3 = gay, 4 = mostly attracted to boys, 5 = bisexual, 6 = pansexual, 7 = queer, 8 = questioning, 9 = asexual, 10 = self-describe, 11 = prefer not to say.
+
+```{r sexual identity}
+demo <- demo %>%
+  mutate(
+    sexuality      = coalesce(as.character(IdentitySexuality), ""),
+    sexuality_text = coalesce(as.character(IdentitySexuality_10_TEXT), ""),
+    sexuality_described = grepl("\\b10\\b", sexuality),
+    SexualityLabel = case_when(
+      sexuality_described & grepl("\\b(demi[-\\s]?sexual|demisexual)\\b", sexuality_text, ignore.case = TRUE)                         ~ "Asexual",
+      sexuality_described & grepl("\\b(skolio[-\\s]?sexual|skoliosexual|omni[-\\s]?sexual|omnisexual)\\b", sexuality_text, ignore.case = TRUE) ~ "Plurisexual",
+      grepl("\\b9\\b", sexuality)            ~ "Asexual",
+      grepl("\\b(5|6)\\b", sexuality)        ~ "Plurisexual",
+      grepl("\\b(1|2|3|4)\\b", sexuality)    ~ "Monosexual",
+      grepl("\\b(7|8)\\b", sexuality)        ~ "Queer",
+      TRUE                                   ~ "Unclassified"
+    )
+  )
+
+sexuality_levels <- c("Monosexual", "Plurisexual", "Asexual", "Queer", "Unclassified")
+
+demo <- mutate(demo, SexualityGroup = as.integer(factor(SexualityLabel, levels = sexuality_levels)))
+
+count(demo, SexualityGroup, SexualityLabel) %>%
+  mutate(pct = round(100 * n / nrow(demo), 2))
+```
+
+## Ethnoracial Identity
+
+Participants could select more than one background. Responses are first summarised in full, then grouped as White (1) or People of Colour (2) for use as a covariate, because some groups were small.
+
+```{r ethnoracial identity full}
+race_labels <- c(
+  "1"  = "Indigenous",
+  "2"  = "Anglo-Celtic",
+  "3"  = "European",
+  "4"  = "Asian",
+  "5"  = "African",
+  "6"  = "Middle Eastern",
+  "7"  = "Latin American",
+  "8"  = "Pacific Islander",
+  "9"  = "North American",
+  "10" = "Jewish",
+  "11" = "Multiracial/Multiethnic/Mixed race",
+  "12" = "Other",
+  "13" = "Prefer not to say"
+)
+
+demo %>%
+  select(Race) %>%
+  separate_rows(Race, sep = ",") %>%
+  mutate(Race = trimws(Race)) %>%
+  filter(Race != "", !is.na(Race)) %>%
+  count(Race) %>%
+  mutate(Label = race_labels[Race],
+         pct   = round(100 * n / sum(n), 2))
+```
+
+```{r ethnoracial identity grouped}
+# Prefer not to say = missing
+# Any Indigenous, Asian, African, Middle Eastern, Latin American or Pacific Islander background, or multiracial = People of Colour
+# Anglo-Celtic, European, North American or Jewish only = White
+demo <- demo %>%
+  mutate(
+    race = coalesce(as.character(Race), ""),
+    RaceAnalysis = case_when(
+      race == ""                                ~ NA_integer_,
+      grepl("\\b13\\b", race)                   ~ NA_integer_,
+      grepl("\\b(1|4|5|6|7|8)\\b", race)        ~ 2L,
+      grepl("\\b11\\b", race)                   ~ 2L,
+      grepl("\\b(2|3|9|10)\\b", race)           ~ 1L,
+      TRUE                                      ~ NA_integer_
+    )
+  )
+
+table(demo$RaceAnalysis, useNA = "ifany")
+round(100 * table(demo$RaceAnalysis, useNA = "ifany") / nrow(demo), 2)
+```
+
+```{r school status}
+# 1 = currently in high school, 2 = not in high school, 3 = prefer not to say
+table(demo$SchoolStatus, useNA = "ifany")
+round(100 * table(demo$SchoolStatus, useNA = "ifany") / nrow(demo), 2)
+```
+
+# Part 3: Scoring
+
+## Sexual Identity Development Experiences
+
+At baseline, participants selected the experiences they had ever had. At each follow-up, they selected the experiences they had in the past month. Each experience becomes a yes (1) or no (0) indicator, and these are summed into a count. Surveys with nothing selected are left missing.
+
+Experiences: 1 = attraction, 2 = self-identification, 3 = disclosure to family, 4 = disclosure to someone else, 5 = non-heterosexual sexual activity, 6 = non-heterosexual romantic relationship, 7 = heterosexual sexual activity, 8 = heterosexual romantic relationship.
+
+```{r identity experience indicators}
+long <- long %>%
+  mutate(
+    SID    = as.character(SID),
+    no_sid = is.na(SID) | SID == "",
+    USIM1  = ifelse(no_sid, NA, as.integer(grepl("\\b1\\b", SID))),
+    USIM2  = ifelse(no_sid, NA, as.integer(grepl("\\b2\\b", SID))),
+    USIM3  = ifelse(no_sid, NA, as.integer(grepl("\\b3\\b", SID))),
+    USIM4  = ifelse(no_sid, NA, as.integer(grepl("\\b4\\b", SID))),
+    USIM5  = ifelse(no_sid, NA, as.integer(grepl("\\b5\\b", SID))),
+    USIM6  = ifelse(no_sid, NA, as.integer(grepl("\\b6\\b", SID))),
+    USIM7  = ifelse(no_sid, NA, as.integer(grepl("\\b7\\b", SID))),
+    USIM8  = ifelse(no_sid, NA, as.integer(grepl("\\b8\\b", SID)))
+  )
+```
+
+```{r identity experience counts}
+long <- long %>%
+  mutate(
+    # Count used in the primary analyses (range 1-8)
+    m   = USIM1 + USIM2 + USIM3 + USIM4 + USIM5 + USIM6 + USIM7 + USIM8,
+
+    # Weighted count (sensitivity analysis): self-identification and both
+    # disclosure experiences count twice
+    m_w = USIM1 + 2 * USIM2 + 2 * USIM3 + 2 * USIM4 + USIM5 + USIM6 + USIM7 + USIM8,
+
+    # Restricted count (sensitivity analysis): both disclosure experiences removed
+    m_r = USIM1 + USIM2 + USIM5 + USIM6 + USIM7 + USIM8
+  )
+
+# Baseline (lifetime) counts are used as a covariate in all models
+baseline_counts <- long %>%
+  filter(Wave == "W0") %>%
+  distinct(ID, .keep_all = TRUE) %>%
+  select(ID, msbase = m, msbase_w = m_w, msbase_r = m_r)
+```
+
+```{r baseline experiences}
+# Percentage of participants who had each experience by baseline
+baseline_sid <- long %>%
+  filter(Wave == "W0") %>%
+  distinct(ID, .keep_all = TRUE)
+
+experience_n <- colSums(baseline_sid[, paste0("USIM", 1:8)] == 1, na.rm = TRUE)
+
+data.frame(
+  Experience = c("Attraction", "Self-identification", "Disclosure to family",
+                 "Disclosure to someone else", "Non-heterosexual sexual activity",
+                 "Non-heterosexual romantic relationship", "Heterosexual sexual activity",
+                 "Heterosexual romantic relationship"),
+  n   = experience_n,
+  pct = round(100 * experience_n / nrow(baseline_sid), 2),
+  row.names = NULL
+)
+```
+
+```{r age of first experience}
+# Age at each first experience (reported at baseline)
+# Ages under 8 are set to 8; ages above 27 are implausible and set to missing
+for (i in 1:8) {
+  age <- as.numeric(demo[[paste0("SID_", i, "_TEXT")]])
+  age[which(age < 8)]  <- 8
+  age[which(age > 27)] <- NA
+  demo[[paste0("PSIM", i)]] <- age
+}
+```
+
+```{r add baseline variables}
+# Add baseline demographics and counts to every wave
+long <- long %>%
+  left_join(select(demo, ID, GenderGroup, SexualityGroup, RaceAnalysis, PSIM1:PSIM8), by = "ID") %>%
+  left_join(baseline_counts, by = "ID")
+```
+
+## Proximal Minority Stress
+
+Each component is scored, then reliability (Cronbach's alpha) and descriptive statistics are reported by wave. These are calculated before timing-based censoring.
+
+```{r internalised homonegativity}
+# Sum of 3 items (each 1-6); at least 2 items required
+long <- long %>%
+  mutate(
+    IntHom1 = as.numeric(IntHom1),
+    IntHom2 = as.numeric(IntHom2),
+    IntHom3 = as.numeric(IntHom3),
+    ih_n    = rowSums(!is.na(cbind(IntHom1, IntHom2, IntHom3))),
+    IntHom  = ifelse(ih_n >= 2, rowSums(cbind(IntHom1, IntHom2, IntHom3), na.rm = TRUE), NA)
+  )
+
+for (w in c("W0", "W1", "W2", "W3", "W4")) {
+  items <- long %>% filter(Wave == w) %>% select(IntHom1, IntHom2, IntHom3)
+  items <- items[rowSums(!is.na(items)) >= 2, ]
+  cat(w, "alpha =", round(psych::alpha(items)$total$raw_alpha, 3), "\n")
+}
+
+long %>%
+  group_by(Wave) %>%
+  summarise(
+    N        = sum(!is.na(IntHom)),
+    Mean     = round(mean(IntHom, na.rm = TRUE), 2),
+    SD       = round(sd(IntHom, na.rm = TRUE), 2),
+    Skewness = round(skew(IntHom, na.rm = TRUE), 2),
+    Kurtosis = round(kurtosi(IntHom, na.rm = TRUE), 2)
+  )
+```
+
+```{r concealment}
+# Mean of 5 items; items were collected on a 0-100 slider and are rescaled to
+# 0-10 to match the original scale; at least 3 items required
+long <- long %>%
+  mutate(
+    NOS_S_1 = as.numeric(NOS_S_1) / 10,
+    NOS_S_2 = as.numeric(NOS_S_2) / 10,
+    NOS_S_3 = as.numeric(NOS_S_3) / 10,
+    NOS_S_4 = as.numeric(NOS_S_4) / 10,
+    NOS_S_5 = as.numeric(NOS_S_5) / 10,
+    con_n   = rowSums(!is.na(cbind(NOS_S_1, NOS_S_2, NOS_S_3, NOS_S_4, NOS_S_5))),
+    NOSC_S  = ifelse(con_n >= 3, rowMeans(cbind(NOS_S_1, NOS_S_2, NOS_S_3, NOS_S_4, NOS_S_5), na.rm = TRUE), NA)
+  )
+
+for (w in c("W0", "W1", "W2", "W3", "W4")) {
+  items <- long %>% filter(Wave == w) %>% select(NOS_S_1, NOS_S_2, NOS_S_3, NOS_S_4, NOS_S_5)
+  items <- items[rowSums(!is.na(items)) >= 3, ]
+  cat(w, "alpha =", round(psych::alpha(items)$total$raw_alpha, 3), "\n")
+}
+
+long %>%
+  group_by(Wave) %>%
+  summarise(
+    N        = sum(!is.na(NOSC_S)),
+    Mean     = round(mean(NOSC_S, na.rm = TRUE), 2),
+    SD       = round(sd(NOSC_S, na.rm = TRUE), 2),
+    Skewness = round(skew(NOSC_S, na.rm = TRUE), 2),
+    Kurtosis = round(kurtosi(NOSC_S, na.rm = TRUE), 2)
+  )
+```
+
+```{r rejection sensitivity}
+# Each of the 6 scenarios is scored as concern (Q1) x expectation (Q2), range 1-36
+# The scale score is the mean of the scenario scores; at least 4 scenarios required
+long <- long %>%
+  mutate(
+    SMARSS1 = as.numeric(RSS1Q1) * as.numeric(RSS1Q2),
+    SMARSS2 = as.numeric(RSS2Q1) * as.numeric(RSS2Q2),
+    SMARSS3 = as.numeric(RSS3Q1) * as.numeric(RSS3Q2),
+    SMARSS4 = as.numeric(RSS4Q1) * as.numeric(RSS4Q2),
+    SMARSS5 = as.numeric(RSS5Q1) * as.numeric(RSS5Q2),
+    SMARSS6 = as.numeric(RSS6Q1) * as.numeric(RSS6Q2),
+    rs_n    = rowSums(!is.na(cbind(SMARSS1, SMARSS2, SMARSS3, SMARSS4, SMARSS5, SMARSS6))),
+    SMARSS  = ifelse(rs_n >= 4, rowMeans(cbind(SMARSS1, SMARSS2, SMARSS3, SMARSS4, SMARSS5, SMARSS6), na.rm = TRUE), NA)
+  )
+
+for (w in c("W0", "W1", "W2", "W3", "W4")) {
+  items <- long %>% filter(Wave == w) %>% select(SMARSS1, SMARSS2, SMARSS3, SMARSS4, SMARSS5, SMARSS6)
+  items <- items[rowSums(!is.na(items)) >= 4, ]
+  cat(w, "alpha =", round(psych::alpha(items)$total$raw_alpha, 3), "\n")
+}
+
+long %>%
+  group_by(Wave) %>%
+  summarise(
+    N        = sum(!is.na(SMARSS)),
+    Mean     = round(mean(SMARSS, na.rm = TRUE), 2),
+    SD       = round(sd(SMARSS, na.rm = TRUE), 2),
+    Skewness = round(skew(SMARSS, na.rm = TRUE), 2),
+    Kurtosis = round(kurtosi(SMARSS, na.rm = TRUE), 2)
+  )
+```
+
+### Component Correlations (Table S1)
+
+```{r component correlations}
+# Pearson correlations between the three components at each wave (pairwise complete cases)
+table_s1 <- data.frame()
+
+for (w in c("W0", "W1", "W2", "W3", "W4")) {
+  d <- filter(long, Wave == w)
+
+  rs_ih  <- cor.test(d$SMARSS, d$IntHom)
+  rs_con <- cor.test(d$SMARSS, d$NOSC_S)
+  ih_con <- cor.test(d$IntHom, d$NOSC_S)
+
+  table_s1 <- rbind(table_s1, data.frame(
+    Wave     = w,
+    n_RS_IH  = sum(complete.cases(d$SMARSS, d$IntHom)),
+    r_RS_IH  = round(rs_ih$estimate, 2),
+    p_RS_IH  = round(rs_ih$p.value, 3),
+    n_RS_CON = sum(complete.cases(d$SMARSS, d$NOSC_S)),
+    r_RS_CON = round(rs_con$estimate, 2),
+    p_RS_CON = round(rs_con$p.value, 3),
+    n_IH_CON = sum(complete.cases(d$IntHom, d$NOSC_S)),
+    r_IH_CON = round(ih_con$estimate, 2),
+    p_IH_CON = round(ih_con$p.value, 3),
+    row.names = NULL
+  ))
+}
+
+table_s1
+```
+
+### Factor Structure (Supplementary Material S2)
+
+Confirmatory factor analysis tests whether the items from the three measures reflect one shared factor, or three related but separate factors. Both models are estimated at each wave using robust maximum likelihood (MLR), with full information maximum likelihood for missing items. Baseline is the primary test and the follow-ups check consistency. The item scores are the same as above (concealment rescaled to 0-10; rejection sensitivity scenario scores).
+
+```{r cfa models}
+# One factor: all 14 items load on a single proximal stress factor
+one_factor <- "
+  Stress =~ IntHom1 + IntHom2 + IntHom3 +
+            NOS_S_1 + NOS_S_2 + NOS_S_3 + NOS_S_4 + NOS_S_5 +
+            SMARSS1 + SMARSS2 + SMARSS3 + SMARSS4 + SMARSS5 + SMARSS6
+"
+
+# Three correlated factors: one for each measure
+three_factor <- "
+  IH  =~ IntHom1 + IntHom2 + IntHom3
+  CON =~ NOS_S_1 + NOS_S_2 + NOS_S_3 + NOS_S_4 + NOS_S_5
+  RS  =~ SMARSS1 + SMARSS2 + SMARSS3 + SMARSS4 + SMARSS5 + SMARSS6
+"
+
+fit_names <- c("chisq.scaled", "df.scaled", "pvalue.scaled", "cfi.robust",
+               "rmsea.robust", "rmsea.ci.lower.robust", "rmsea.ci.upper.robust",
+               "srmr", "aic", "bic")
+```
+
+```{r cfa baseline}
+w0_items <- filter(long, Wave == "W0")
+
+fit_one_w0   <- cfa(one_factor,   data = w0_items, estimator = "MLR", missing = "fiml", std.lv = TRUE)
+fit_three_w0 <- cfa(three_factor, data = w0_items, estimator = "MLR", missing = "fiml", std.lv = TRUE)
+
+# Model fit
+round(rbind(
+  One_Factor   = fitMeasures(fit_one_w0,   fit_names),
+  Three_Factor = fitMeasures(fit_three_w0, fit_names)
+), 3)
+
+# Scaled chi-square difference test
+lavTestLRT(fit_three_w0, fit_one_w0, method = "satorra.bentler.2001")
+
+# Standardised loadings and factor correlations for the three-factor model
+standardizedSolution(fit_three_w0) %>%
+  filter(op == "=~" | (op == "~~" & lhs != rhs)) %>%
+  select(lhs, op, rhs, est.std, se, pvalue) %>%
+  mutate(across(c(est.std, se, pvalue), ~ round(.x, 3)))
+```
+
+```{r cfa follow-ups}
+# The same comparison at each follow-up (before timing-based censoring)
+for (w in c("W1", "W2", "W3", "W4")) {
+  wave_items <- filter(long, Wave == w)
+
+  fit_one   <- cfa(one_factor,   data = wave_items, estimator = "MLR", missing = "fiml", std.lv = TRUE)
+  fit_three <- cfa(three_factor, data = wave_items, estimator = "MLR", missing = "fiml", std.lv = TRUE)
+
+  cat("\n", w, "\n")
+  print(round(rbind(
+    One_Factor   = fitMeasures(fit_one,   fit_names),
+    Three_Factor = fitMeasures(fit_three, fit_names)
+  ), 3))
+  print(lavTestLRT(fit_three, fit_one, method = "satorra.bentler.2001"))
+}
+```
+
+### Stable Versus Changing Variance
+
+The intraclass correlation (ICC) shows the share of variance due to stable differences between participants. The remainder reflects change from wave to wave.
+
+```{r component iccs}
+icc_rs <- as.data.frame(VarCorr(lmer(SMARSS ~ 1 + (1 | ID), data = long)))
+icc_ih <- as.data.frame(VarCorr(lmer(IntHom ~ 1 + (1 | ID), data = long)))
+icc_con <- as.data.frame(VarCorr(lmer(NOSC_S ~ 1 + (1 | ID), data = long)))
+
+# ICC = between-person variance / (between-person variance + within-person variance)
+round(c(
+  RejectionSensitivity = icc_rs$vcov[1]  / sum(icc_rs$vcov),
+  IntHomonegativity    = icc_ih$vcov[1]  / sum(icc_ih$vcov),
+  Concealment          = icc_con$vcov[1] / sum(icc_con$vcov)
+), 3)
+```
+
+### Composite Score
+
+Each component is converted to a z-score using the mean and SD pooled across all waves, so change across waves is kept. The composite is the mean of the available z-scores (at least 2 of 3 required). A second composite without concealment is used in a sensitivity analysis.
+
+```{r composite}
+long <- long %>%
+  mutate(
+    SMARSS_z = (SMARSS - mean(SMARSS, na.rm = TRUE)) / sd(SMARSS, na.rm = TRUE),
+    IntHom_z = (IntHom - mean(IntHom, na.rm = TRUE)) / sd(IntHom, na.rm = TRUE),
+    NOSC_S_z = (NOSC_S - mean(NOSC_S, na.rm = TRUE)) / sd(NOSC_S, na.rm = TRUE),
+
+    comp_n     = rowSums(!is.na(cbind(SMARSS_z, IntHom_z, NOSC_S_z))),
+    StressComp = ifelse(comp_n >= 2, rowMeans(cbind(SMARSS_z, IntHom_z, NOSC_S_z), na.rm = TRUE), NA),
+
+    # Concealment removed (sensitivity analysis); both components required
+    StressComp_s = ifelse(!is.na(SMARSS_z) & !is.na(IntHom_z), (SMARSS_z + IntHom_z) / 2, NA)
+  )
+
+long %>%
+  group_by(Wave) %>%
+  summarise(
+    N        = sum(!is.na(StressComp)),
+    Mean     = round(mean(StressComp, na.rm = TRUE), 2),
+    SD       = round(sd(StressComp, na.rm = TRUE), 2),
+    Skewness = round(skew(StressComp, na.rm = TRUE), 2),
+    Kurtosis = round(kurtosi(StressComp, na.rm = TRUE), 2)
+  )
+
+icc_comp <- as.data.frame(VarCorr(lmer(StressComp ~ 1 + (1 | ID), data = long)))
+round(icc_comp$vcov[1] / sum(icc_comp$vcov), 3)
+```
+
+## Distal Minority Stress
+
+Each of the 9 items asks whether an event happened because of sexuality (1), gender (2) or neither (3), and more than one option can be selected. Each item is scored 0 to 2 (one point each for sexuality and gender), then summed. The total is missing only if all items are missing.
+
+```{r distal stress}
+for (i in 1:9) {
+  x <- as.character(long[[paste0("EISS", i)]])
+  item_missing <- is.na(x) | trimws(x) == ""
+  score <- grepl("\\b1\\b", x) + grepl("\\b2\\b", x)
+  score[item_missing] <- NA
+  long[[paste0("EISS", i, "_event")]] <- score
+}
+
+eiss_items <- paste0("EISS", 1:9, "_event")
+
+long <- long %>%
+  mutate(
+    eiss_n = rowSums(!is.na(long[, eiss_items])),
+    EISS_A = ifelse(eiss_n == 0, NA, rowSums(long[, eiss_items], na.rm = TRUE))
+  )
+
+# Alpha uses complete responses only
+for (w in c("W0", "W1", "W2", "W3", "W4")) {
+  items <- long %>% filter(Wave == w) %>% select(all_of(eiss_items))
+  items <- items[complete.cases(items), ]
+  cat(w, "alpha =", round(psych::alpha(items)$total$raw_alpha, 3), "\n")
+}
+
+long %>%
+  group_by(Wave) %>%
+  summarise(
+    N        = sum(!is.na(EISS_A)),
+    Mean     = round(mean(EISS_A, na.rm = TRUE), 2),
+    SD       = round(sd(EISS_A, na.rm = TRUE), 2),
+    Skewness = round(skew(EISS_A, na.rm = TRUE), 2),
+    Kurtosis = round(kurtosi(EISS_A, na.rm = TRUE), 2)
+  )
+
+icc_eiss <- as.data.frame(VarCorr(lmer(EISS_A ~ 1 + (1 | ID), data = long)))
+round(icc_eiss$vcov[1] / sum(icc_eiss$vcov), 3)
+```
+
+## Mental Health Distress
+
+The 12-item Mini-DASS covers depression, anxiety and stress (4 items each). Items are rescaled from 1-4 to 0-3 and summed (range 0-36). At least 10 items are required.
+
+```{r distress}
+dass_items <- c(paste0("DASS_D", 1:4), paste0("DASS_A", 1:4), paste0("DASS_S", 1:4))
+
+for (item in dass_items) {
+  long[[item]] <- as.numeric(long[[item]]) - 1
+}
+
+long <- long %>%
+  mutate(
+    dass_n     = rowSums(!is.na(long[, dass_items])),
+    DASS_Total = ifelse(dass_n >= 10, rowSums(long[, dass_items], na.rm = TRUE), NA)
+  )
+
+for (w in c("W0", "W1", "W2", "W3", "W4")) {
+  items <- long %>% filter(Wave == w) %>% select(all_of(dass_items))
+  items <- items[rowSums(!is.na(items)) >= 10, ]
+  cat(w, "alpha =", round(psych::alpha(items)$total$raw_alpha, 3), "\n")
+}
+
+long %>%
+  group_by(Wave) %>%
+  summarise(
+    N        = sum(!is.na(DASS_Total)),
+    Mean     = round(mean(DASS_Total, na.rm = TRUE), 2),
+    SD       = round(sd(DASS_Total, na.rm = TRUE), 2),
+    Skewness = round(skew(DASS_Total, na.rm = TRUE), 2),
+    Kurtosis = round(kurtosi(DASS_Total, na.rm = TRUE), 2)
+  )
+
+icc_dass <- as.data.frame(VarCorr(lmer(DASS_Total ~ 1 + (1 | ID), data = long)))
+round(icc_dass$vcov[1] / sum(icc_dass$vcov), 3)
+```
+
+# Part 4: Analytic Dataset
+
+## Variables Kept
+
+```{r variables kept}
+# Baseline variables (the same at every wave)
+baseline_vars <- c("Age", "RaceAnalysis", "GenderGroup", "SexualityGroup",
+                   "msbase", "msbase_w", "msbase_r", paste0("PSIM", 1:8))
+
+# Scores measured at each wave
+wave_vars <- c("IntHom", "NOSC_S", "SMARSS", "StressComp", "StressComp_s",
+               "EISS_A", "DASS_Total", "m", "m_w", "m_r", paste0("USIM", 1:8))
+
+final <- long %>%
+  select(ID, Wave, Tolerance, all_of(baseline_vars), all_of(wave_vars)) %>%
+  mutate(across(all_of(c(baseline_vars, wave_vars)), as.numeric)) %>%
+  arrange(ID, Wave)
+```
+
+## Timing-Based Censoring
+
+Follow-up surveys completed outside the 22.5 to 37.5 day window are set to missing. The participant's other surveys are kept, and baseline is never censored.
+
+```{r censoring}
+final <- final %>%
+  mutate(
+    censor   = Wave != "W0" & !is.na(Tolerance) & Tolerance == FALSE,
+    has_data = rowSums(!is.na(final[, wave_vars])) > 0
+  )
+
+# Surveys censored at each wave
+final %>%
+  filter(censor, has_data) %>%
+  count(Wave)
+
+for (v in wave_vars) {
+  final[[v]][final$censor] <- NA
+}
+
+# Surveys with data at each wave after censoring
+final %>%
+  filter(rowSums(!is.na(final[, wave_vars])) > 0) %>%
+  count(Wave)
+```
+
+```{r identity experience distribution}
+# Distribution of monthly identity experience counts after censoring (reported in the Measures)
+final %>%
+  filter(Wave != "W0", !is.na(m)) %>%
+  group_by(Wave) %>%
+  summarise(
+    N        = n(),
+    Mean     = round(mean(m), 2),
+    SD       = round(sd(m), 2),
+    Min      = min(m),
+    Max      = max(m),
+    Skewness = round(skew(m), 2),
+    Kurtosis = round(kurtosi(m), 2)
+  )
+```
+
+## Save the Analytic Dataset
+
+The models use wide format: one row per participant, with wave-specific variables named by wave (for example, `StressComp_W0` to `StressComp_W4`).
+
+```{r save}
+wide <- final %>%
+  select(ID, Wave, all_of(wave_vars)) %>%
+  distinct(ID, Wave, .keep_all = TRUE) %>%
+  pivot_wider(id_cols = ID, names_from = Wave, values_from = all_of(wave_vars), names_sep = "_")
+
+# Add baseline variables
+baseline_data <- final %>%
+  filter(Wave == "W0") %>%
+  distinct(ID, .keep_all = TRUE) %>%
+  select(ID, all_of(baseline_vars))
+
+GZMCore <- left_join(wide, baseline_data, by = "ID")
+
+write_csv(GZMCore, "GZMCore.csv", na = "")
+saveRDS(GZMCore, "GZMCore.rds")
+```

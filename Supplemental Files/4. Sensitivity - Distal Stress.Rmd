@@ -1,0 +1,628 @@
+---
+title: "Sensitivity Analysis: Distal Minority Stress"
+author: "XXXX"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+This file tests distal minority stress (discrimination) in two ways (Supplementary Material S4):
+
+* as a monthly predictor of the stress and distress deviations, in the same way as the identity development experiences (Tables S3a and S3b)
+* as a baseline covariate added to the final model (Table S12)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(dplyr)
+library(MplusAutomation)
+
+# Set WD
+set.seed(123)
+setwd("C:XXXX")
+
+# Import data
+GZMCore <- readRDS("C:XXXX")
+
+# Fit indices reported in the tables
+fit_cols <- c("Title", "Parameters", "ChiSqM_Value", "ChiSqM_DF", "ChiSqM_PValue",
+              "CFI", "RMSEA_Estimate", "RMSEA_90CI_LB", "RMSEA_90CI_UB", "SRMR", "AIC", "BIC")
+```
+
+# Mplus Data
+
+`d` = distal stress (discrimination) at W0 to W4.
+
+```{r mplus data}
+GZMCore <- GZMCore %>%
+  mutate(
+    # Proximal minority stress composite (x) and distress (y), W0 to W4
+    x1 = StressComp_W0, x2 = StressComp_W1, x3 = StressComp_W2, x4 = StressComp_W3, x5 = StressComp_W4,
+    y1 = DASS_Total_W0, y2 = DASS_Total_W1, y3 = DASS_Total_W2, y4 = DASS_Total_W3, y5 = DASS_Total_W4,
+
+    # Gender: 0 = cisgender, 1 = trans or gender diverse
+    gender = case_when(GenderGroup %in% c(1, 2) ~ 0, GenderGroup %in% c(3, 4, 5, 6) ~ 1),
+
+    # Ethnoracial identity: 0 = White, 1 = People of Colour
+    race = case_when(RaceAnalysis == 1 ~ 0, RaceAnalysis == 2 ~ 1),
+
+    # Age and baseline (lifetime) identity experience count, centred on the sample mean
+    Age0    = Age - mean(Age, na.rm = TRUE),
+    msbase0 = msbase - mean(msbase, na.rm = TRUE),
+
+    # Baseline distress group: 0 = at or below the median, 1 = above the median
+    dgrp = case_when(y1 <= median(y1, na.rm = TRUE) ~ 0, y1 > median(y1, na.rm = TRUE) ~ 1)
+  )
+
+GZMCore <- GZMCore %>%
+  mutate(
+    d1 = EISS_A_W0, d2 = EISS_A_W1, d3 = EISS_A_W2, d4 = EISS_A_W3, d5 = EISS_A_W4,
+
+    # Baseline distal stress, centred on the sample mean (used as a covariate)
+    dbase0 = EISS_A_W0 - mean(EISS_A_W0, na.rm = TRUE)
+  )
+
+mplus_z <- GZMCore %>%
+  select(m_W1, m_W2, m_W3, m_W4, x1, x2, x3, x4, x5, d1, d2, d3, d4, d5,
+         y1, y2, y3, y4, y5, msbase0, Age0, gender, race, dgrp)
+mplus_z[is.na(mplus_z)] <- -99
+prepareMplusData(mplus_z, "modelz.dat")
+```
+
+# Distal Stress Growth Shape (Table S3a)
+
+```{r distal stress growth models}
+# Intercept only
+mplusSyntaxG1Disc <- ("
+TITLE: G1Disc Intercept-only growth model - Distal Stress;
+
+DATA:
+  FILE = modelz.dat;
+
+VARIABLE:
+  NAMES = m2-m5 x1-x5 d1-d5 y1-y5 msbase0 Age0 gender race dgrp;
+  USEVARIABLES = d1-d5;
+  MISSING = ALL(-99);
+
+ANALYSIS:
+  ESTIMATOR = MLR;
+  PROCESSORS = 6;
+
+MODEL:
+  idisc | d1@0 d2@0 d3@0 d4@0 d5@0;
+  [idisc];
+  idisc;
+  [d1-d5@0];
+
+OUTPUT:
+  TECH1 STDYX CINTERVAL;
+")
+writeLines(mplusSyntaxG1Disc, "modelg1disc.inp")
+
+# Fixed linear slope
+mplusSyntaxG2Disc <- ("
+TITLE: G2Disc Fixed linear slope growth model - Distal Stress;
+
+DATA:
+  FILE = modelz.dat;
+
+VARIABLE:
+  NAMES = m2-m5 x1-x5 d1-d5 y1-y5 msbase0 Age0 gender race dgrp;
+  USEVARIABLES = d1-d5;
+  MISSING = ALL(-99);
+
+ANALYSIS:
+  ESTIMATOR = MLR;
+  PROCESSORS = 6;
+
+MODEL:
+  idisc sdisc | d1@0 d2@1 d3@2 d4@3 d5@4;
+  [idisc sdisc];
+  idisc;
+  sdisc@0;
+  [d1-d5@0];
+
+OUTPUT:
+  TECH1 STDYX CINTERVAL;
+")
+writeLines(mplusSyntaxG2Disc, "modelg2disc.inp")
+
+# Random linear slope
+mplusSyntaxG3Disc <- ("
+TITLE: G3Disc Random linear slope growth model - Distal Stress;
+
+DATA:
+  FILE = modelz.dat;
+
+VARIABLE:
+  NAMES = m2-m5 x1-x5 d1-d5 y1-y5 msbase0 Age0 gender race dgrp;
+  USEVARIABLES = d1-d5;
+  MISSING = ALL(-99);
+
+ANALYSIS:
+  ESTIMATOR = MLR;
+  PROCESSORS = 6;
+
+MODEL:
+  idisc sdisc | d1@0 d2@1 d3@2 d4@3 d5@4;
+  [idisc sdisc];
+  idisc;
+  sdisc;
+  idisc WITH sdisc;
+  [d1-d5@0];
+
+OUTPUT:
+  TECH1 STDYX CINTERVAL;
+")
+writeLines(mplusSyntaxG3Disc, "modelg3disc.inp")
+
+# Freed time scores (retained)
+mplusSyntaxG4Disc <- ("
+TITLE: G4Disc Freed time scores growth model - Distal Stress;
+
+DATA:
+  FILE = modelz.dat;
+
+VARIABLE:
+  NAMES = m2-m5 x1-x5 d1-d5 y1-y5 msbase0 Age0 gender race dgrp;
+  USEVARIABLES = d1-d5;
+  MISSING = ALL(-99);
+
+ANALYSIS:
+  ESTIMATOR = MLR;
+  PROCESSORS = 6;
+
+MODEL:
+  ! Freed time scores - intermediate loadings estimated freely
+  ! d1 fixed at 0, d5 fixed at 1 for identification
+  idisc sdisc | d1@0 d2* d3* d4* d5@1;
+  [idisc sdisc];
+  idisc sdisc;
+  idisc WITH sdisc;
+  [d1-d5@0];
+
+OUTPUT:
+  TECH1 STDYX CINTERVAL;
+")
+writeLines(mplusSyntaxG4Disc, "modelg4disc.inp")
+```
+
+```{r run distal stress growth models}
+runModels("modelg1disc.inp")
+runModels("modelg2disc.inp")
+runModels("modelg3disc.inp")
+runModels("modelg4disc.inp")
+```
+
+```{r table s3a}
+table_s3a <- bind_rows(
+  readModels("modelg1disc.out", what = "summaries")$summaries,
+  readModels("modelg2disc.out", what = "summaries")$summaries,
+  readModels("modelg3disc.out", what = "summaries")$summaries,
+  readModels("modelg4disc.out", what = "summaries")$summaries
+) %>%
+  select(any_of(fit_cols))
+
+table_s3a
+write.csv(table_s3a, "TableS3a_distal_growth_fit.csv", row.names = FALSE)
+
+# Slope mean, slope variance and intercept-slope covariance (reported in S4)
+g4disc <- readModels("modelg4disc.out", what = "parameters")$parameters
+filter(g4disc$unstandardized, param %in% c("IDISC", "SDISC"))
+filter(g4disc$stdyx.standardized, paramHeader == "IDISC.WITH")
+```
+
+# Distal Stress as a Monthly Predictor (Table S3b)
+
+```{r distal stress monthly models}
+# Same-month effects
+mplusSyntaxDisc_con <- ("
+TITLE: DISC_CON Discrimination as contemporaneous time-varying predictor;
+DATA:
+  FILE = modelz.dat;
+VARIABLE:
+  NAMES = m2-m5 x1-x5 d1-d5 y1-y5 msbase0 Age0 gender race dgrp;
+  USEVARIABLES = d1-d5 x1-x5 y1-y5 dgrp;
+  MISSING = ALL(-99);
+ANALYSIS:
+  ESTIMATOR = MLR;
+  PROCESSORS = 6;
+MODEL:
+  ! Stress trajectory - freed time scores
+  ix sx | x1@0 x2@0.126 x3@-0.194 x4@-0.695 x5@1;
+  [ix sx];
+  ix sx;
+  ix WITH sx;
+
+  ! Distress trajectory - fixed slope
+  iy sy | y1@0 y2@1 y3@2 y4@3 y5@4;
+  [iy sy];
+  iy;
+  sy@0;
+
+  ! Between-person covariances
+  ix WITH iy;
+  sx WITH iy;
+
+  [x1-x5@0];
+  [y1-y5@0];
+
+  ! Stress structured residuals
+  rx1 BY x1@1; rx2 BY x2@1; rx3 BY x3@1; rx4 BY x4@1; rx5 BY x5@1;
+  [rx1-rx5@0];
+  x1-x5@0;
+
+  ! Distress structured residuals
+  ry1 BY y1@1; ry2 BY y2@1; ry3 BY y3@1; ry4 BY y4@1; ry5 BY y5@1;
+  [ry1-ry5@0];
+  y1-y5@0;
+
+  rx1;
+  rx2-rx5 (vsx);
+  ry1;
+  ry2-ry5 (vdy);
+
+  ! Stress AR - equality constrained
+  rx2 ON rx1 (arx);
+  rx3 ON rx2 (arx);
+  rx4 ON rx3 (arx);
+  rx5 ON rx4 (arx);
+
+  ! Distress AR - freely estimated
+  ry2 ON ry1;
+  ry3 ON ry2;
+  ry4 ON ry3;
+  ry5 ON ry4;
+
+  ! Within-time covariances
+  rx1 WITH ry1;
+  rx2 WITH ry2;
+  rx3 WITH ry3;
+  rx4 WITH ry4;
+  rx5 WITH ry5;
+
+  ! Discrimination as contemporaneous time-varying predictor
+  ! Equality constrained across waves
+  rx1 ON d1 (disc_x_con);
+  rx2 ON d2 (disc_x_con);
+  rx3 ON d3 (disc_x_con);
+  rx4 ON d4 (disc_x_con);
+  rx5 ON d5 (disc_x_con);
+
+  ry1 ON d1 (disc_y_con);
+  ry2 ON d2 (disc_y_con);
+  ry3 ON d3 (disc_y_con);
+  ry4 ON d4 (disc_y_con);
+  ry5 ON d5 (disc_y_con);
+
+  ! Discrimination endogenous means and variances
+  [d1-d5];
+  d1-d5;
+
+  ! Covariates
+  ix ON dgrp;
+  sx ON dgrp;
+  iy ON dgrp;
+
+OUTPUT:
+  TECH1 STDYX CINTERVAL;
+")
+writeLines(mplusSyntaxDisc_con, "modeldisc_con.inp")
+
+# Next-month effects
+mplusSyntaxDisc_lag <- ("
+TITLE: DISC_LAG Discrimination as lagged time-varying predictor;
+DATA:
+  FILE = modelz.dat;
+VARIABLE:
+  NAMES = m2-m5 x1-x5 d1-d5 y1-y5 msbase0 Age0 gender race dgrp;
+  USEVARIABLES = d1-d5 x1-x5 y1-y5 dgrp;
+  MISSING = ALL(-99);
+ANALYSIS:
+  ESTIMATOR = MLR;
+  PROCESSORS = 6;
+MODEL:
+  ix sx | x1@0 x2@0.126 x3@-0.194 x4@-0.695 x5@1;
+  [ix sx];
+  ix sx;
+  ix WITH sx;
+
+  iy sy | y1@0 y2@1 y3@2 y4@3 y5@4;
+  [iy sy];
+  iy;
+  sy@0;
+
+  ix WITH iy;
+  sx WITH iy;
+
+  [x1-x5@0];
+  [y1-y5@0];
+
+  rx1 BY x1@1; rx2 BY x2@1; rx3 BY x3@1; rx4 BY x4@1; rx5 BY x5@1;
+  [rx1-rx5@0];
+  x1-x5@0;
+
+  ry1 BY y1@1; ry2 BY y2@1; ry3 BY y3@1; ry4 BY y4@1; ry5 BY y5@1;
+  [ry1-ry5@0];
+  y1-y5@0;
+
+  rx1;
+  rx2-rx5 (vsx);
+  ry1;
+  ry2-ry5 (vdy);
+
+  rx2 ON rx1 (arx);
+  rx3 ON rx2 (arx);
+  rx4 ON rx3 (arx);
+  rx5 ON rx4 (arx);
+
+  ry2 ON ry1;
+  ry3 ON ry2;
+  ry4 ON ry3;
+  ry5 ON ry4;
+
+  rx1 WITH ry1;
+  rx2 WITH ry2;
+  rx3 WITH ry3;
+  rx4 WITH ry4;
+  rx5 WITH ry5;
+
+  ! Discrimination lagged effects
+  ! Discrimination at wave t predicting residuals at wave t+1
+  rx2 ON d1 (disc_x_lag);
+  rx3 ON d2 (disc_x_lag);
+  rx4 ON d3 (disc_x_lag);
+  rx5 ON d4 (disc_x_lag);
+
+  ry2 ON d1 (disc_y_lag);
+  ry3 ON d2 (disc_y_lag);
+  ry4 ON d3 (disc_y_lag);
+  ry5 ON d4 (disc_y_lag);
+
+  [d1-d5];
+  d1-d5;
+
+  ix ON dgrp;
+  sx ON dgrp;
+  iy ON dgrp;
+
+OUTPUT:
+  TECH1 STDYX CINTERVAL;
+")
+writeLines(mplusSyntaxDisc_lag, "modeldisc_lag.inp")
+
+# Same-month and next-month effects
+mplusSyntaxDisc_both <- ("
+TITLE: DISC_BOTH Discrimination contemporaneous and lagged;
+DATA:
+  FILE = modelz.dat;
+VARIABLE:
+  NAMES = m2-m5 x1-x5 d1-d5 y1-y5 msbase0 Age0 gender race dgrp;
+  USEVARIABLES = d1-d5 x1-x5 y1-y5 dgrp;
+  MISSING = ALL(-99);
+ANALYSIS:
+  ESTIMATOR = MLR;
+  PROCESSORS = 6;
+MODEL:
+  ix sx | x1@0 x2@0.126 x3@-0.194 x4@-0.695 x5@1;
+  [ix sx];
+  ix sx;
+  ix WITH sx;
+
+  iy sy | y1@0 y2@1 y3@2 y4@3 y5@4;
+  [iy sy];
+  iy;
+  sy@0;
+
+  ix WITH iy;
+  sx WITH iy;
+
+  [x1-x5@0];
+  [y1-y5@0];
+
+  rx1 BY x1@1; rx2 BY x2@1; rx3 BY x3@1; rx4 BY x4@1; rx5 BY x5@1;
+  [rx1-rx5@0];
+  x1-x5@0;
+
+  ry1 BY y1@1; ry2 BY y2@1; ry3 BY y3@1; ry4 BY y4@1; ry5 BY y5@1;
+  [ry1-ry5@0];
+  y1-y5@0;
+
+  rx1;
+  rx2-rx5 (vsx);
+  ry1;
+  ry2-ry5 (vdy);
+
+  rx2 ON rx1 (arx);
+  rx3 ON rx2 (arx);
+  rx4 ON rx3 (arx);
+  rx5 ON rx4 (arx);
+
+  ry2 ON ry1;
+  ry3 ON ry2;
+  ry4 ON ry3;
+  ry5 ON ry4;
+
+  rx1 WITH ry1;
+  rx2 WITH ry2;
+  rx3 WITH ry3;
+  rx4 WITH ry4;
+  rx5 WITH ry5;
+
+  ! Contemporaneous effects
+  rx1 ON d1 (disc_x_con);
+  rx2 ON d2 (disc_x_con);
+  rx3 ON d3 (disc_x_con);
+  rx4 ON d4 (disc_x_con);
+  rx5 ON d5 (disc_x_con);
+
+  ry1 ON d1 (disc_y_con);
+  ry2 ON d2 (disc_y_con);
+  ry3 ON d3 (disc_y_con);
+  ry4 ON d4 (disc_y_con);
+  ry5 ON d5 (disc_y_con);
+
+  ! Lagged effects
+  rx2 ON d1 (disc_x_lag);
+  rx3 ON d2 (disc_x_lag);
+  rx4 ON d3 (disc_x_lag);
+  rx5 ON d4 (disc_x_lag);
+
+  ry2 ON d1 (disc_y_lag);
+  ry3 ON d2 (disc_y_lag);
+  ry4 ON d3 (disc_y_lag);
+  ry5 ON d4 (disc_y_lag);
+
+  [d1-d5];
+  d1-d5;
+
+  ix ON dgrp;
+  sx ON dgrp;
+  iy ON dgrp;
+
+OUTPUT:
+  TECH1 STDYX CINTERVAL;
+")
+writeLines(mplusSyntaxDisc_both, "modeldisc_both.inp")
+
+runModels("modeldisc_con.inp")
+runModels("modeldisc_lag.inp")
+runModels("modeldisc_both.inp")
+```
+
+```{r table s3b}
+table_s3b <- bind_rows(
+  readModels("modeldisc_con.out",  what = "summaries")$summaries,
+  readModels("modeldisc_lag.out",  what = "summaries")$summaries,
+  readModels("modeldisc_both.out", what = "summaries")$summaries
+) %>%
+  select(any_of(fit_cols))
+
+table_s3b
+write.csv(table_s3b, "TableS3b_distal_monthly_fit.csv", row.names = FALSE)
+```
+
+# Distal Stress as a Baseline Covariate (Table S12)
+
+```{r covariate data}
+mplus_z_cov <- GZMCore %>%
+  select(m_W1, m_W2, m_W3, m_W4, x1, x2, x3, x4, x5, d1, d2, d3, d4, d5,
+         y1, y2, y3, y4, y5, msbase0, Age0, gender, race, dgrp, dbase0)
+mplus_z_cov[is.na(mplus_z_cov)] <- -99
+prepareMplusData(mplus_z_cov, "modelz_cov.dat")
+```
+
+```{r covariate model}
+mplusSyntaxdist_cond <- ("
+TITLE: Final conditional LCM-SR - SIDEs contemporaneous + all covariates 
+  + distal stress as a covariate;
+
+DATA:
+  FILE = modelz_cov.dat;
+
+VARIABLE:
+  NAMES = m2-m5 x1-x5 d1-d5 y1-y5 msbase0 Age0 gender 
+    race dgrp dbase0;
+  USEVARIABLES = m2-m5 x1-x5 y1-y5 msbase0 Age0 gender 
+    race dgrp dbase0;
+  MISSING = ALL(-99);
+
+ANALYSIS:
+  ESTIMATOR = MLR;
+  PROCESSORS = 6;
+
+MODEL:
+  ! Stress trajectory - freed time scores
+  ix sx | x1@0 x2@0.126 x3@-0.194 x4@-0.695 x5@1;
+  [ix sx];
+  ix sx;
+  ix WITH sx;
+
+  ! Distress trajectory - fixed slope
+  iy sy | y1@0 y2@1 y3@2 y4@3 y5@4;
+  [iy sy];
+  iy;
+  sy@0;
+
+  ! Between-person cross-construct covariances
+  ix WITH iy;
+  sx WITH iy;
+
+  [x1-x5@0];
+  [y1-y5@0];
+
+  ! Stress structured residuals
+  rx1 BY x1@1; rx2 BY x2@1; rx3 BY x3@1; rx4 BY x4@1; rx5 BY x5@1;
+  [rx1-rx5@0];
+  x1-x5@0;
+
+  ! Distress structured residuals
+  ry1 BY y1@1; ry2 BY y2@1; ry3 BY y3@1; ry4 BY y4@1; ry5 BY y5@1;
+  [ry1-ry5@0];
+  y1-y5@0;
+
+  rx1;
+  rx2-rx5 (vsx);
+  ry1;
+  ry2-ry5 (vdy);
+
+  ! Stress AR - equality constrained
+  rx2 ON rx1 (arx);
+  rx3 ON rx2 (arx);
+  rx4 ON rx3 (arx);
+  rx5 ON rx4 (arx);
+
+  ! Distress AR - freely estimated
+  ry2 ON ry1;
+  ry3 ON ry2;
+  ry4 ON ry3;
+  ry5 ON ry4;
+
+  ! Within-time covariances - freely estimated
+  rx1 WITH ry1;
+  rx2 WITH ry2;
+  rx3 WITH ry3;
+  rx4 WITH ry4;
+  rx5 WITH ry5;
+
+  ! Contemporaneous SIDE effects - equality constrained across waves
+  rx2 ON m2 (sides_x_con);
+  rx3 ON m3 (sides_x_con);
+  rx4 ON m4 (sides_x_con);
+  rx5 ON m5 (sides_x_con);
+
+  ry2 ON m2 (sides_y_con);
+  ry3 ON m3 (sides_y_con);
+  ry4 ON m4 (sides_y_con);
+  ry5 ON m5 (sides_y_con);
+
+  ! Time-invariant covariates predicting growth factors
+  ! dbase0 added as between-person distal stress covariate
+  ix ON dgrp Age0 gender race msbase0 dbase0;
+  sx ON dgrp Age0 gender race msbase0 dbase0;
+  iy ON dgrp Age0 gender race msbase0 dbase0;
+
+  ! Time-invariant covariates predicting milestone exposure
+  m2-m5 ON dgrp Age0 gender race msbase0 dbase0;
+
+OUTPUT:
+  TECH1 STDYX CINTERVAL;
+")
+writeLines(mplusSyntaxdist_cond, "modeldist_cond.inp")
+runModels("modeldist_cond.inp")
+```
+
+```{r table s12}
+distal <- readModels("modeldist_cond.out", what = c("summaries", "parameters"))
+select(distal$summaries, any_of(fit_cols))
+
+table_s12 <- distal$parameters$stdyx.standardized %>%
+  left_join(select(distal$parameters$ci.stdyx.standardized, paramHeader, param, low2.5, up2.5),
+            by = c("paramHeader", "param"))
+write.csv(table_s12, "TableS12_distal_covariate.csv", row.names = FALSE)
+
+# Key results: identity experience effects, between-person covariances and distal stress effects
+filter(table_s12, param %in% c("M2", "M3", "M4", "M5"))
+filter(table_s12, paramHeader %in% c("IX.WITH", "SX.WITH"))
+filter(table_s12, param == "DBASE0")
+```
+
